@@ -1,3 +1,11 @@
+$token_response = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
+$secure_token = $token_response.Token
+$ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure_token)
+$azure_token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+
+$graph_token = ""
+
 function New-EntraGroup {
   param (
     [CmdletBinding()]
@@ -339,23 +347,6 @@ function Get-PIMAzureRoleEligibleAssignment {
 
 }
 
-function Get-PIMForGroupsEligibleAssignment {
-  param (
-    [Parameter(Mandatory = $true)]
-    [string]$EntraGroupID,    
-    [Parameter(Mandatory = $true)]
-    [string]$PrincipalID,      
-    [Parameter(Mandatory = $true)]
-    [string]$AccessToken
-  )
-
-  (Invoke-GraphAPIRequest `
-    -GraphURL "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilitySchedules?`$filter=groupId eq '$($EntraGroupID)' and principalId eq '$($PrincipalID)'" `
-    -Method GET `
-    -AccessToken $AccessToken).value.principalId
-
-}
-
 function New-PIMForGroupsEligibleAssignment {
   param (
     [Parameter(Mandatory = $true)]
@@ -387,30 +378,6 @@ function New-PIMForGroupsEligibleAssignment {
     -AccessToken $AccessToken
 }
 
-Export-ModuleMember -Function @(
-    'New-EntraGroup'
-    'New-EntraGroupMember'
-    'Enable-EntraPIMGroup'
-    'Get-EntraPIMGroup'
-    'New-PIMGroupSettingsRule'
-    'Get-AzureRoleGUID'
-    'New-PIMAzureRoleSettingsRule'
-    'New-PIMAzureRoleActiveAssignment'
-    'New-AzureRoleAssignment'
-    'New-PIMAzureRoleEligibleAssignment'
-    'New-PIMForGroupsEligibleAssignment'
-    'Get-PIMAzureRoleEligibleAssignment'
-    'Get-PIMForGroupsEligibleAssignment'
-)
-
-
-$token_response = Get-AzAccessToken -ResourceUrl "https://management.azure.com"
-$secure_token = $token_response.Token
-$ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure_token)
-$azure_token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
-[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
-
-
 $headers = @{
     Authorization  = "Bearer $($azure_token)"
     "Content-Type" = "application/json"
@@ -420,30 +387,6 @@ $lookup_table = @(
     @{
         ResourceName = "test-kv-001-az"
         RoleName     = "Contributor"
-        UsePIM       = $true
-        Members      = @("nik.chikersal@azurecloudsecurity.com", "eric.williams@automateyourpowershell.com")
-    }
-    @{
-        ResourceName = "Terraform"
-        RoleName     = "Contributor"
-        UsePIM       = $true
-        Members      = @("nik.chikersal@azurecloudsecurity.com", "eric.williams@automateyourpowershell.com")
-    }
-    @{
-        ResourceName = "PWSH-Prod"
-        RoleName     = "Contributor"
-        UsePIM       = $true
-        Members      = @("nik.chikersal@azurecloudsecurity.com", "eric.williams@automateyourpowershell.com")
-    }
-    @{
-        ResourceName = "group-resource4"
-        RoleName     = "Contributor"
-        UsePIM       = $true
-        Members      = @("nik.chikersal@azurecloudsecurity.com", "eric.williams@automateyourpowershell.com")
-    }
-    @{
-        ResourceName = "group-resource5"
-        RoleName     = "Reader"
         UsePIM       = $true
         Members      = @("nik.chikersal@azurecloudsecurity.com", "eric.williams@automateyourpowershell.com")
     }
@@ -525,26 +468,31 @@ foreach ($item in $lookup_table) {
         #IF PIM Group block
         $true {
             $group_name = "sec-pim-" + $item.ResourceName + "-" + $item.RoleName.Replace(" ", "-").ToLower()
-            $group_exists = (Invoke-GraphAPIRequest -GraphURL "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$($group_name)'" -Method GET -AccessToken $graph_token).value | Out-Null
+            $group_exists = (Invoke-GraphAPIRequest -GraphURL "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$($group_name)'" -Method GET -AccessToken $graph_token)
 
             #if group exists, add members to eligible assignment
             if ($group_exists.id) {
                 foreach ($member in $item.Members) {
-                    $user_object_id = (Invoke-GraphAPIRequest -GraphURL "https://graph.microsoft.com/v1.0/users?`$filter=userprincipalname eq '$($member)'" -Method GET -AccessToken $graph_token).value.id
+                    $user_object_id = Invoke-GraphAPIRequest -GraphURL "https://graph.microsoft.com/v1.0/users?`$filter=userprincipalname eq '$($member)'" -Method GET -AccessToken $graph_token
                         
                     #check if user already has eligible assignment to group
-                    $existing_eligible_assignment = Get-PIMForGroupsEligibleAssignment -EntraGroupID $group_exists.id -PrincipalID $user_object_id -AccessToken $graph_token
-                        
-                    if (-not $existing_eligible_assignment) {
+                    $existing_entra_group_id = ([string]$group_exists.id).Trim()
+                    $existing_user_object_id = ([string]$user_object_id.id).Trim()
+                    $existing_eligible_assignment = (Invoke-GraphAPIRequest `
+  -GraphURL "https://graph.microsoft.com/v1.0/identityGovernance/privilegedAccess/group/eligibilityScheduleInstances?`$filter=groupId eq '$($existing_entra_group_id)'" `
+  -Method GET `
+  -AccessToken $graph_token).principalId -contains $existing_user_object_id
+  
+                    if ($existing_eligible_assignment -eq $false) {
                         #set eligible assignment for user to existing PIM Group
-                        New-PIMForGroupsEligibleAssignment -EntraGroupID $group_exists.id -PrincipalID $user_object_id -AccessToken $graph_token -Verbose
+                        New-PIMForGroupsEligibleAssignment -EntraGroupID $existing_entra_group_id -PrincipalID $existing_user_object_id -AccessToken $graph_token -Verbose
                     }
                     else {
                         Write-Warning "User $($member) already has an eligible assignment to group $($group_name)"
                     }
                 }
             }
-            elseif (-not ($group_exists)) {
+            elseif (-not ($group_exists.id)) {
                 #create PIM group
                 $new_entra_group = New-EntraGroup -EntraGroupName $group_name.ToLower() -AccessToken $graph_token
                 Start-Sleep -Seconds 10
@@ -867,12 +815,14 @@ New-PIMGroupSettingsRule -RolePolicyID $pim_group_policy_id -NotificationRecipie
         } 
         $false {
             $group_name = "sec-" + $item.ResourceName + "-" + $item.RoleName.Replace(" ", "-").ToLower()
-            $group_exists = (Invoke-GraphAPIRequest -GraphURL "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$($group_name)'" -Method GET -AccessToken $graph_token).value | Out-Null
+            $group_exists = (Invoke-GraphAPIRequest -GraphURL "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$($group_name)'" -Method GET -AccessToken $graph_token)
 
-            #if group exists, add members to eligible assignment
-            if ($group_exists) {
-                $user_object_id = (Invoke-GraphAPIRequest -GraphURL "https://graph.microsoft.com/v1.0/users?`$filter=userprincipalname eq '$($member)'" -Method GET -AccessToken $graph_token).value.id
-                New-EntraGroupMember -EntraGroupID $group_exists.id -EntraUserID $user_object_id -AccessToken $graph_token
+            #if group exists, add members to group
+            if ($group_exists.id) {
+              $existing_entra_group_id = ([string]$group_exists.id).Trim()
+              $existing_user_object_id = ([string]$user_object_id).Trim()
+              $user_object_id = (Invoke-GraphAPIRequest -GraphURL "https://graph.microsoft.com/v1.0/users?`$filter=userprincipalname eq '$($member)'" -Method GET -AccessToken $graph_token).value.id
+              New-EntraGroupMember -EntraGroupID $existing_entra_group_id -EntraUserID $existing_user_object_id -AccessToken $graph_token
                
             }
             elseif (-not ($group_exists.id)) {
